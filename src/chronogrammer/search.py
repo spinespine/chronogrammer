@@ -16,7 +16,7 @@ imperfect candidate, regardless of semantic similarity or length.
 from __future__ import annotations
 
 import dataclasses
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .generator import CandidateGenerator, DeterministicGenerator
 from .scorer import chronogram_score
@@ -130,6 +130,7 @@ class SearchResult:
     error: int
     objective: float
     candidates: list[str]
+    exact_matches: list[str] = dataclasses.field(default_factory=list)
 
 
 def beam_search(
@@ -141,6 +142,7 @@ def beam_search(
     steps: int = 8,
     weights: ObjectiveWeights = _DEFAULT_WEIGHTS,
     similarity: SemanticSimilarity | None = None,
+    on_exact_match: Callable[[SearchResult], bool] | None = None,
 ) -> SearchResult:
     """Run beam search to find a rewrite of *source* whose chronogram total
     equals *target*.
@@ -148,7 +150,12 @@ def beam_search(
     At each step, every item in the current beam is expanded by calling each
     generator and collecting its candidates.  The combined pool is deduplicated
     and the best ``beam_width`` items (by objective score) are kept for the
-    next round.  The search terminates early if an exact chronogram is found.
+    next round.
+
+    When an exact chronogram is found, ``on_exact_match`` is called with a
+    partial ``SearchResult``.  If it returns ``True`` the search continues
+    (useful for interactive "find more" prompts); if it returns ``False`` or
+    is ``None``, the search stops.
 
     Parameters
     ----------
@@ -167,6 +174,10 @@ def beam_search(
         Objective weight configuration.
     similarity:
         Semantic-similarity backend.  Defaults to ``JaccardSimilarity``.
+    on_exact_match:
+        Optional callback invoked each time an exact chronogram is found.
+        Receives the current ``SearchResult`` (with ``exact_matches`` populated
+        so far).  Return ``True`` to keep searching, ``False`` to stop.
 
     Returns
     -------
@@ -189,6 +200,7 @@ def beam_search(
     best_score: float = score(source)
 
     seen: set[str] = {source}
+    exact_matches: list[str] = []
 
     for _ in range(steps):
         pool: list[str] = []
@@ -213,11 +225,30 @@ def beam_search(
             best = beam[0]
             best_score = score(beam[0])
 
-        # Early exit on exact chronogram
+        # Handle exact chronogram
         if chronogram_score(best) == target:
-            break
+            if best not in exact_matches:
+                exact_matches.append(best)
+            partial = SearchResult(
+                best=best,
+                chronogram_score=target,
+                target=target,
+                error=0,
+                objective=best_score,
+                candidates=list(beam),
+                exact_matches=list(exact_matches),
+            )
+            keep_going = on_exact_match(partial) if on_exact_match is not None else False
+            if not keep_going:
+                break
+            # Remove the already-found match from the beam so search explores elsewhere
+            beam = [c for c in beam if chronogram_score(c) != target] or beam
 
     chron = chronogram_score(best)
+    # Collect any additional exact matches sitting in the final beam
+    for c in beam:
+        if chronogram_score(c) == target and c not in exact_matches:
+            exact_matches.append(c)
     return SearchResult(
         best=best,
         chronogram_score=chron,
@@ -225,4 +256,5 @@ def beam_search(
         error=abs(chron - target),
         objective=best_score,
         candidates=beam,
+        exact_matches=exact_matches,
     )

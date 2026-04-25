@@ -59,7 +59,12 @@ def _result_report(result: SearchResult, source: str) -> str:
         f"    Score : {result.chronogram_score}",
         "",
     ]
-    if len(result.candidates) > 1:
+    if result.exact_matches:
+        lines.append(f"  All exact matches found ({len(result.exact_matches)}):")
+        for i, m in enumerate(result.exact_matches, 1):
+            lines.append(f'    {i}. "{m}"')
+        lines.append("")
+    elif len(result.candidates) > 1:
         lines.append("  Top candidates:")
         for i, cand in enumerate(result.candidates[:5], 1):
             s = chronogram_score(cand)
@@ -101,6 +106,8 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
                 model=args.model,
                 base_url=args.ollama_url,
                 num_candidates=args.llm_candidates,
+                timeout=args.llm_timeout,
+                original=args.text,
             )
         )
     # Always include the deterministic baseline
@@ -111,6 +118,18 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
         semantic_drift=args.w_sem,
         length_penalty=args.w_len,
     )
+
+    def _on_exact_match(partial: SearchResult) -> bool:
+        """Print a match and ask the user whether to keep searching."""
+        n = len(partial.exact_matches)
+        print(f"\n  ✓ Exact match #{n} found (score={partial.chronogram_score}):", file=sys.stderr)
+        print(f'    "{partial.best}"', file=sys.stderr)
+        try:
+            ans = input("  Continue searching for more matches? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            return False
+        return ans in ("y", "yes")
 
     print(
         f"\nSearching for chronogram of {args.target} …",
@@ -123,6 +142,7 @@ def cmd_rewrite(args: argparse.Namespace) -> int:
         beam_width=args.beam_width,
         steps=args.steps,
         weights=weights,
+        on_exact_match=_on_exact_match,
     )
 
     print("\nChronogram rewrite\n" + "─" * 40)
@@ -240,6 +260,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=20,
         metavar="N",
         help="Number of candidates to request from the LLM per step (default: 20).",
+    )
+    rewrite_p.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=300,
+        metavar="SECS",
+        help="Timeout in seconds for each Ollama API call (default: 300).",
     )
     rewrite_p.set_defaults(func=cmd_rewrite)
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import itertools
 import re
+import sys
 from typing import Protocol, runtime_checkable
 
 from .scorer import chronogram_score
@@ -343,17 +344,24 @@ class DeterministicGenerator:
         return candidates[: self._max]
 
 
+# Words that are not worth targeting as LLM replacement slots.
+_SKIP_WORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "but", "nor", "yet", "so",
+    "in", "on", "at", "to", "of", "for", "by", "up", "as",
+    "its", "it", "is", "are", "was", "were", "has", "had",
+    "not", "all", "any", "our", "his", "her",
+})
+
+
 class OllamaGenerator:
     """Candidate generator backed by a locally-running Ollama LLM.
 
-    This generator calls the Ollama REST API (``http://localhost:11434`` by
-    default).  It is **not** activated by default and requires:
-
-    1. Ollama installed and running locally (https://ollama.ai).
-    2. A pulled model, e.g. ``ollama pull mistral``.
-    3. The ``requests`` library: ``pip install chronogrammer[llm]``.
-
-    See the README section *"Plugging in a local LLM"* for a full walkthrough.
+    Uses full-context, forced-slot generation: each call selects one specific
+    word to replace (rotated across calls to prevent loops) and asks the model
+    to suggest alternatives with the **complete original sentence always in
+    view** as a semantic anchor.  This exploits the LLM's next-token prediction
+    strength — it is excellent at "what word fits naturally here given this
+    surrounding context?" — while keeping the arithmetic scoring on our side.
 
     Parameters
     ----------
@@ -362,9 +370,13 @@ class OllamaGenerator:
     base_url:
         Base URL of the Ollama API.
     num_candidates:
-        How many candidates to request per call.
+        How many replacement options to request per call.
     timeout:
         HTTP request timeout in seconds.
+    original:
+        The user's original sentence.  Used as a permanent semantic anchor so
+        every LLM call can see what meaning must be preserved even as the beam
+        evolves.  If ``None``, the first text passed to ``generate`` is used.
     """
 
     def __init__(
@@ -372,34 +384,167 @@ class OllamaGenerator:
         model: str = "mistral",
         base_url: str = "http://localhost:11434",
         num_candidates: int = 20,
-        timeout: int = 60,
+        timeout: int = 300,
+        original: str | None = None,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._num_candidates = num_candidates
         self._timeout = timeout
+        self._original: str | None = original
+        # Monotonically incrementing counter used to rotate which word slot is
+        # targeted each call, ensuring beam-item diversity.
+        self._call_counter: int = 0
+        # Tracks every replacement already suggested for each slot word so we
+        # can tell the model what NOT to output, preventing it from burning the
+        # entire candidate budget re-suggesting its top-probability tokens.
+        # Key: lowercase slot word.  Value: set of lowercase replacements tried.
+        self._tried: dict[str, set[str]] = {}
 
-    def _build_prompt(self, source: str, target: int) -> str:
-        current = chronogram_score(source)
+    def _select_slots(self, text: str, target: int) -> list[dict]:
+        """Return substitutable word slots sorted by replacement feasibility.
+
+        For each content word (≥ 3 letters), compute:
+        - ``word_score``: its current Roman-numeral contribution
+        - ``needed``: the Roman-numeral sum the replacement must have to reach
+          *target* in one swap (``word_score + delta``)
+        - ``feasible``: whether ``needed`` is in a range real English words
+          can plausibly achieve (0–1500)
+
+        Feasible slots come first; ties broken by highest ``word_score``
+        (more Roman letters = more room to manoeuvre).
+        """
+        current = chronogram_score(text)
         delta = target - current
-        direction = "increase" if delta > 0 else "decrease"
+        tokens = _tokenize_preserve_case(text)
+        slots = []
+        for i, tok in enumerate(tokens):
+            if not tok.strip():
+                continue
+            clean = re.sub(r"[^a-zA-Z]", "", tok)
+            if len(clean) < 4 or clean.lower() in _SKIP_WORDS:
+                continue
+            ws = chronogram_score(clean)
+            needed = ws + delta
+            slots.append(
+                {
+                    "index": i,
+                    "word": clean,
+                    "word_score": ws,
+                    "needed": needed,
+                    "feasible": 0 <= needed <= 1500,
+                }
+            )
+        # When delta < 0 (score too high), we want to replace high-value words
+        # with lighter synonyms → sort by descending word_score.
+        # When delta >= 0 (score too low), prefer feasible slots (those where
+        # a natural synonym might plausibly land near the needed value) first.
+        if delta < 0:
+            slots.sort(key=lambda s: -s["word_score"])
+        else:
+            slots.sort(key=lambda s: (not s["feasible"], -s["word_score"]))
+        return slots
+
+    def _build_slot_prompt(
+        self,
+        original: str,
+        current: str,
+        word: str,
+        n: int,
+        exclude: set[str],
+    ) -> str:
+        """Build a full-context, forced-slot replacement prompt.
+
+        The model is used purely for its linguistic ability: given the original
+        sentence as a semantic anchor and the current candidate with one word
+        bracketed, produce diverse alternatives that fit grammatically and
+        preserve meaning.  Roman-numeral arithmetic is entirely our concern —
+        the model has no knowledge of the letter-by-letter spelling of its own
+        output tokens, so mentioning target values would only add noise.
+        """
+        marked = re.sub(
+            rf"(?i)\b{re.escape(word)}\b",
+            f"[{word}]",
+            current,
+            count=1,
+        )
+        exclusion_line = (
+            f"  - Do NOT use any of these (already tried): "
+            + ", ".join(sorted(exclude)[:30])  # cap list length in prompt
+            + "\n"
+            if exclude
+            else ""
+        )
         return (
-            f"You are revising a sentence to act as a chronogram.\n\n"
-            f"Roman-letter values (additive, case-insensitive):\n"
-            f"I=1, V=5, X=10, L=50, C=100, D=500, M=1000\n\n"
-            f"Original sentence:\n\"{source}\"\n\n"
-            f"Target Roman-letter total: {target}\n"
-            f"Current total: {current}\n"
-            f"We need to {direction} the total by {abs(delta)}.\n\n"
-            f"Rewrite the sentence with minimal semantic drift.\n"
-            f"Preserve all facts, entities, and tone.\n"
-            f"Prefer the smallest possible lexical changes.\n"
-            f"Return exactly {self._num_candidates} alternatives, one per line, "
-            f"with no numbering or extra commentary."
+            f"Replace the bracketed word in the sentence below with {n} different "
+            f"alternatives that preserve the original meaning and fit grammatically.\n\n"
+            f"Original sentence:\n"
+            f'  "{original}"\n\n'
+            f"Sentence to edit:\n"
+            f'  "{marked}"\n\n'
+            f"Rules:\n"
+            f"  - Output ONLY the replacement word or short phrase (up to 3 words)\n"
+            f"  - One option per line, no numbering, no extra commentary\n"
+            f"  - Do not reproduce the full sentence\n"
+            f"  - Each option must fit naturally where [{word}] appears\n"
+            + exclusion_line
         )
 
-    def generate(self, source: str, target: int) -> list[str]:
-        """Call Ollama to generate paraphrase candidates.
+    def _call_ollama(self, prompt: str, requests_mod) -> list[str]:
+        """Stream one Ollama request and return all non-empty response lines."""
+        import json as _json
+
+        payload = {
+            "model": self._model,
+            "prompt": prompt,
+            "stream": True,
+            "think": False,  # disable chain-of-thought (qwen3 etc.) for speed
+        }
+        url = f"{self._base_url}/api/generate"
+        try:
+            resp = requests_mod.post(
+                url, json=payload, timeout=self._timeout, stream=True
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Ollama API request failed: {exc}\n"
+                "Ensure Ollama is running locally and the model is pulled."
+            ) from exc
+
+        parts: list[str] = []
+        sys.stderr.write("    ")
+        sys.stderr.flush()
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            chunk = _json.loads(raw_line)
+            token = chunk.get("response", "")
+            parts.append(token)
+            sys.stderr.write(token)
+            sys.stderr.flush()
+            if chunk.get("done"):
+                break
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+        return [ln.strip() for ln in "".join(parts).splitlines() if ln.strip()]
+
+    def generate(self, text: str, target: int) -> list[str]:
+        """Generate candidates via full-context, forced-slot LLM substitution.
+
+        Algorithm
+        ---------
+        1. Auto-capture the original sentence on first call (if not supplied at
+           construction) so it is available as a semantic anchor forever after.
+        2. Select all substitutable word slots ranked by replacement feasibility.
+        3. Pick one slot per call using a round-robin counter — each invocation
+           targets a *different* word, so consecutive beam-search expansions
+           never get stuck swapping the same token.
+        4. Ask the LLM (with full sentence context) for ``num_candidates``
+           alternatives for that one word.  The model never does arithmetic;
+           we score every reconstructed sentence ourselves.
+        5. Return candidates sorted by proximity to *target*.
 
         Raises
         ------
@@ -415,25 +560,85 @@ class OllamaGenerator:
                 "Install it with: pip install chronogrammer[llm]"
             ) from exc
 
-        prompt = self._build_prompt(source, target)
-        payload = {
-            "model": self._model,
-            "prompt": prompt,
-            "stream": False,
-        }
-        try:
-            response = requests.post(
-                f"{self._base_url}/api/generate",
-                json=payload,
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Ollama API request failed: {exc}\n"
-                "Ensure Ollama is running locally and the model is pulled."
-            ) from exc
+        # Capture original sentence on first call
+        if self._original is None:
+            self._original = text
 
-        raw = response.json().get("response", "")
-        candidates = [line.strip() for line in raw.splitlines() if line.strip()]
+        current_score = chronogram_score(text)
+        if current_score == target:
+            return []
+
+        tokens = _tokenize_preserve_case(text)
+        all_slots = self._select_slots(text, target)
+        if not all_slots:
+            return []
+
+        # Round-robin across all slots.  _select_slots already orders them so
+        # that words most likely to make per-step progress come first:
+        #   - when delta < 0 (score too high): highest word_score first, so
+        #     the LLM replaces heavy Roman words with lighter synonyms
+        #   - when delta > 0 (score too low): feasible (low word_score) slots
+        #     first, so the LLM replaces light words with heavier synonyms
+        # The model never sees any of this arithmetic — it just produces
+        # natural alternatives; we score every result ourselves.
+        slot = all_slots[self._call_counter % len(all_slots)]
+        self._call_counter += 1
+
+        word = slot["word"]
+        idx = slot["index"]
+        word_key = word.lower()
+        already_tried = self._tried.get(word_key, set())
+
+        print(
+            f"  [Ollama] Δ={target - current_score:+d} | targeting \"{word}\""
+            + (f" (excl. {len(already_tried)})" if already_tried else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+
+        prompt = self._build_slot_prompt(
+            self._original, text, word, self._num_candidates, already_tried
+        )
+        replacements = self._call_ollama(prompt, requests)
+
+        candidates: list[str] = []
+        seen: set[str] = {text}
+        seen_lower: set[str] = set()  # case-insensitive dedup within this response
+        new_tried: set[str] = set()
+        for repl in replacements:
+            # Strip stray list markers the model may have added
+            clean = re.sub(r"^[\d\.\)\-\*\s]+", "", repl).strip()
+            # Remove any brackets that leaked through from the prompt
+            clean = clean.strip("[]")
+            # Reject empty, unchanged, or sentence-length outputs.
+            if (
+                not clean
+                or clean.lower() == word.lower()
+                or len(clean.split()) > 3
+                or clean.endswith((".", "?", "!"))
+            ):
+                continue
+            # Case-insensitive dedup within this batch
+            if clean.lower() in seen_lower:
+                continue
+            seen_lower.add(clean.lower())
+            new_tried.add(clean.lower())
+            candidate = _replace_word(tokens, idx, clean)
+            if candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+
+        # Record all suggestions (including ones filtered as duplicates) so
+        # future calls for the same slot word avoid them.
+        if word_key not in self._tried:
+            self._tried[word_key] = set()
+        self._tried[word_key].update(new_tried)
+
+        candidates.sort(key=lambda c: abs(chronogram_score(c) - target))
+        best_err = abs(chronogram_score(candidates[0]) - target) if candidates else "n/a"
+        print(
+            f"  [Ollama] {len(candidates)} candidates — best error = {best_err}",
+            file=sys.stderr,
+            flush=True,
+        )
         return candidates[: self._num_candidates]
